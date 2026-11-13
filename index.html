@@ -1,0 +1,511 @@
+<!doctype html>
+<html lang="ms">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Compliance Track</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<script>tailwind.config = { darkMode: 'class' };</script>
+<script src="https://unpkg.com/@phosphor-icons/web@2.1.1"></script>
+<style>
+  body { font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif; font-size: 14px; }
+  @media (max-width: 639px) { body { font-size: 15px; } }
+  .mono { font-family: 'JetBrains Mono', monospace; }
+  .spin { animation: spin 1s linear infinite; display: inline-block; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body class="bg-slate-50 text-slate-900 dark:bg-slate-900 dark:text-slate-100 min-h-screen">
+<div id="app"></div>
+<div id="toasts" class="fixed z-[60] top-3 left-1/2 -translate-x-1/2 sm:left-auto sm:right-4 sm:translate-x-0 w-[calc(100%-32px)] sm:w-96 space-y-2" aria-live="polite"></div>
+<div id="modal-root"></div>
+
+<script>
+'use strict';
+/* ============================================================
+   Compliance Track - frontend (Fasa 1)
+   Semua semakan role dibuat di server. Browser hanya memaparkan.
+   Data daripada server dimasukkan ke DOM dengan textContent (fungsi h), tiada innerHTML.
+   ============================================================ */
+const API_URL = "";
+
+/* ---------- util DOM ---------- */
+function h(tag, props, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (v === null || v === undefined || v === false) continue;
+    if (k === 'class') el.className = v;
+    else if (k === 'text') el.textContent = v;
+    else if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2), v);
+    else el.setAttribute(k, v === true ? '' : String(v));
+  }
+  kids.flat(Infinity).forEach(c => {
+    if (c === null || c === undefined || c === false) return;
+    el.append(c.nodeType ? c : document.createTextNode(String(c)));
+  });
+  return el;
+}
+const icon = (name, extra) => h('i', { class: 'ph-bold ph-' + name + (extra ? ' ' + extra : ''), 'aria-hidden': 'true' });
+const $ = id => document.getElementById(id);
+
+/* ---------- gaya ---------- */
+const C = {
+  card: 'bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl',
+  input: 'w-full min-h-[44px] px-3 rounded-xl border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-700',
+  label: 'block text-sm font-semibold mb-1',
+  btn: 'inline-flex items-center justify-center gap-2 min-h-[44px] px-4 rounded-xl font-semibold disabled:opacity-60 disabled:cursor-not-allowed',
+  primary: 'bg-emerald-700 hover:bg-emerald-800 text-white',
+  secondary: 'border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700',
+  muted: 'text-slate-600 dark:text-slate-400',
+  err: 'text-rose-700 dark:text-rose-400 text-sm mt-1'
+};
+const btn = (label, kind, props) => h('button', Object.assign({ type: 'button', class: C.btn + ' ' + (kind === 'primary' ? C.primary : C.secondary) }, props), label);
+
+/* ---------- state & sesi ---------- */
+const state = { user: null, certTypes: null, designations: [] };
+function getToken() { try { return sessionStorage.getItem('ct_token') || ''; } catch (e) { return ''; } }
+function setToken(t) { try { t ? sessionStorage.setItem('ct_token', t) : sessionStorage.removeItem('ct_token'); } catch (e) { /* abaikan */ } }
+
+class ApiError extends Error { constructor(code, msg) { super(msg); this.code = code; } }
+
+async function api(action, params) {
+  if (!API_URL) throw new ApiError('API_BELUM_DISET', 'API_URL belum diset dalam app/index.html');
+  let res;
+  try {
+    res = await fetch(API_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ action, params: params || {}, token: getToken() }) });
+  } catch (e) { throw new ApiError('RANGKAIAN', 'Tak dapat sambung ke server. Semak internet dan cuba lagi'); }
+  let json;
+  try { json = await res.json(); } catch (e) { throw new ApiError('RALAT_SERVER', 'Jawapan server tak sah. Cuba lagi'); }
+  if (!json.ok) {
+    if (json.code === 'SESI_TAMAT' && action !== 'login') { endSession('Sesi tamat, login semula'); }
+    if (json.code === 'PIN_PERLU_TUKAR' && state.user) { state.user.must_change_pin = true; location.hash = '#/tukar-pin'; }
+    throw new ApiError(json.code, json.error);
+  }
+  return json.data;
+}
+
+function endSession(msg) {
+  setToken(''); state.user = null; state.certTypes = null; closeAllModals();
+  showLogin(msg || '');
+}
+
+/* ---------- toast & modal ---------- */
+function toast(msg, kind) {
+  const isErr = kind === 'error';
+  const el = h('div', { role: isErr ? 'alert' : 'status', class: 'flex items-start gap-2 p-3 rounded-xl shadow-lg border text-sm ' + (isErr ? 'bg-rose-50 text-rose-700 border-rose-200' : 'bg-emerald-50 text-emerald-700 border-emerald-200') },
+    icon(isErr ? 'warning-circle' : 'check-circle'), h('div', { class: 'flex-1' }, msg),
+    h('button', { type: 'button', 'aria-label': 'Tutup', class: 'min-w-[24px]', onclick: () => el.remove() }, icon('x')));
+  $('toasts').append(el);
+  if (!isErr) setTimeout(() => el.remove(), 4000);
+}
+
+const modals = [];
+function closeAllModals() { while (modals.length) modals.pop().close(); }
+function openModal(title, body, wide) {
+  const prevFocus = document.activeElement;
+  const backdrop = h('div', { class: 'fixed inset-0 z-50 bg-slate-900/60 flex items-end sm:items-center justify-center p-0 sm:p-4', role: 'dialog', 'aria-modal': 'true', 'aria-label': title });
+  const box = h('div', { class: C.card + ' w-full ' + (wide ? 'sm:max-w-3xl' : 'sm:max-w-lg') + ' max-h-[92vh] overflow-y-auto rounded-b-none sm:rounded-b-xl shadow-xl' });
+  const api_ = { close() {
+    const i = modals.indexOf(api_); if (i >= 0) modals.splice(i, 1);
+    backdrop.remove(); document.removeEventListener('keydown', onKey); if (api_.onClose) api_.onClose();
+    if (prevFocus && prevFocus.focus) prevFocus.focus();
+  } };
+  const onKey = e => { if (e.key === 'Escape' && modals[modals.length - 1] === api_) api_.close(); };
+  box.append(h('div', { class: 'flex items-center justify-between px-4 py-3 border-b border-slate-200 dark:border-slate-700 sticky top-0 bg-white dark:bg-slate-800 z-10' },
+    h('h2', { class: 'text-lg font-bold' }, title), h('button', { type: 'button', 'aria-label': 'Tutup', class: 'min-w-[44px] min-h-[44px]', onclick: () => api_.close() }, icon('x'))), body);
+  backdrop.append(box);
+  backdrop.addEventListener('mousedown', e => { if (e.target === backdrop) api_.close(); });
+  $('modal-root').append(backdrop); modals.push(api_); document.addEventListener('keydown', onKey);
+  const first = box.querySelector('input:not([readonly]),select,textarea,button[type=submit]'); if (first) first.focus();
+  return api_;
+}
+
+/* ---------- operasi sibuk (spinner pada butang) ---------- */
+async function busy(button, fn) {
+  const kids = Array.from(button.childNodes); button.disabled = true;
+  button.replaceChildren(h('span', { class: 'spin' }, icon('spinner-gap')), ' Sila tunggu');
+  try { return await fn(); } finally { button.disabled = false; button.replaceChildren(...kids); }
+}
+const errText = e => (e && e.message) ? e.message : 'Ralat tak dijangka';
+
+/* ---------- format ---------- */
+function fmtDate(s) { if (!s) return '-'; const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s); return m ? m[3] + '/' + m[2] + '/' + m[1] : s; }
+const REC_LABEL = { Verified: ['Disahkan', 'check-circle'], Pending: ['Menunggu verifikasi', 'hourglass'], Rejected: ['Ditolak', 'x-circle'], Superseded: ['Diganti (sejarah)', 'clock-counter-clockwise'] };
+function chip(status) {
+  const [t, ic] = REC_LABEL[status] || [status, 'info'];
+  const cls = status === 'Pending' ? 'bg-sky-50 text-sky-700' : status === 'Verified' ? 'bg-slate-100 text-slate-700' : 'bg-slate-100 text-slate-600';
+  return h('span', { class: 'inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium ' + cls }, icon(ic), t);
+}
+
+/* ---------- fail: kecilkan imej, sahkan jenis & saiz ---------- */
+const MAX_PDF = 3 * 1024 * 1024;
+function readB64(blob) {
+  return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(',')[1] || ''); r.onerror = () => rej(new Error('Fail tak dapat dibaca')); r.readAsDataURL(blob); });
+}
+async function prepareFile(file) {
+  if (!file) return null;
+  if (file.type === 'application/pdf') {
+    if (file.size > MAX_PDF) throw new Error('PDF terlalu besar (' + (file.size / 1048576).toFixed(1) + ' MB). Maksimum 3 MB');
+    return { mime: 'application/pdf', name: file.name, data: await readB64(file) };
+  }
+  if (file.type === 'image/jpeg' || file.type === 'image/png') {
+    const url = URL.createObjectURL(file);
+    try {
+      const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => rej(new Error('Imej rosak atau tak dapat dibaca')); i.src = url; });
+      const scale = Math.min(1, 1600 / img.width);
+      const cv = document.createElement('canvas'); cv.width = Math.round(img.width * scale); cv.height = Math.round(img.height * scale);
+      const ctx = cv.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, cv.width, cv.height); ctx.drawImage(img, 0, 0, cv.width, cv.height);
+      const blob = await new Promise(res => cv.toBlob(res, 'image/jpeg', 0.8));
+      if (!blob) throw new Error('Imej tak dapat diproses');
+      if (blob.size > MAX_PDF) throw new Error('Imej masih terlalu besar selepas dikecilkan');
+      return { mime: 'image/jpeg', name: file.name.replace(/\.[^.]+$/, '') + '.jpg', data: await readB64(blob) };
+    } finally { URL.revokeObjectURL(url); }
+  }
+  throw new Error('Jenis fail tak dibenarkan. Hanya JPG, PNG atau PDF');
+}
+
+/* ---------- pratonton fail (lazy, melalui getCertFile) ---------- */
+async function viewFile(certId, title) {
+  const body = h('div', { class: 'p-4 min-h-[200px] flex items-center justify-center' }, h('span', { class: C.muted }, h('span', { class: 'spin' }, icon('spinner-gap')), ' Memuatkan fail...'));
+  let objUrl = null;
+  const m = openModal(title || 'Fail cert', body, true);
+  m.onClose = () => { if (objUrl) URL.revokeObjectURL(objUrl); };
+  try {
+    const f = await api('getCertFile', { cert_id: certId });
+    const bin = atob(f.data); const bytes = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    objUrl = URL.createObjectURL(new Blob([bytes], { type: f.mime }));
+    body.className = 'p-2';
+    if (f.mime === 'application/pdf') body.replaceChildren(h('iframe', { src: objUrl, title: f.name, class: 'w-full h-[70vh] rounded-lg border border-slate-200' }));
+    else if (f.mime.startsWith('image/')) body.replaceChildren(h('img', { src: objUrl, alt: f.name, class: 'mx-auto max-h-[75vh] object-contain' }));
+    else body.replaceChildren(h('p', { class: 'p-4' }, 'Jenis fail ini tak boleh dipratonton.'));
+  } catch (e) { body.replaceChildren(h('p', { class: C.err + ' p-4', role: 'alert' }, e.code === 'SESI_TAMAT' ? '' : 'Fail tak dapat dibuka: ' + errText(e))); }
+}
+
+/* ---------- data bersama ---------- */
+async function loadCertTypes() { if (!state.certTypes) state.certTypes = (await api('listCertTypes')).cert_types; return state.certTypes; }
+
+/* ============================================================
+   S-01 LOGIN & TUKAR PIN
+   ============================================================ */
+function pinField(id, label, autocomplete) {
+  const inp = h('input', { id, type: 'password', inputmode: 'numeric', pattern: '[0-9]*', maxlength: '6', autocomplete: autocomplete || 'off', class: C.input + ' mono tracking-widest', required: true });
+  const tog = h('button', { type: 'button', 'aria-label': 'Tunjuk atau sembunyi PIN', class: 'absolute right-1 top-0 min-w-[44px] min-h-[44px]', onclick: () => { inp.type = inp.type === 'password' ? 'text' : 'password'; } }, icon('eye'));
+  return { inp, el: h('div', {}, h('label', { for: id, class: C.label }, label), h('div', { class: 'relative' }, inp, tog)) };
+}
+
+function showLogin(msg) {
+  const login = h('input', { id: 'login_id', type: 'text', autocomplete: 'username', autocapitalize: 'none', class: C.input, required: true });
+  const pin = pinField('login_pin', 'PIN (6 digit)', 'current-password');
+  const err = h('p', { class: C.err, role: 'alert', hidden: !msg }, msg || '');
+  const submit = h('button', { type: 'submit', class: C.btn + ' ' + C.primary + ' w-full' }, 'Masuk');
+  const form = h('form', { class: 'space-y-4', novalidate: true,
+    onsubmit: async e => {
+      e.preventDefault(); err.hidden = true;
+      try {
+        const d = await busy(submit, () => api('login', { login_id: login.value, pin: pin.inp.value }));
+        setToken(d.token); state.user = d.user; pin.inp.value = '';
+        location.hash = d.user.must_change_pin ? '#/tukar-pin' : (d.user.role === 'Staf' ? '#/cert-saya' : '#/personel');
+        route();
+      } catch (ex) { err.textContent = errText(ex); err.hidden = false; }
+    } },
+    h('div', {}, h('label', { for: 'login_id', class: C.label }, 'Email atau ID staf'), login), pin.el, err, submit);
+  $('app').replaceChildren(h('main', { class: 'min-h-screen flex items-center justify-center p-4' },
+    h('div', { class: C.card + ' w-full max-w-sm p-6 shadow-sm' },
+      h('div', { class: 'mb-5' }, h('div', { class: 'w-10 h-1 bg-yellow-500 mb-3 rounded' }), h('h1', { class: 'text-2xl font-bold' }, 'Compliance Track'), h('p', { class: C.muted }, 'Pack Cert Personel')),
+      API_URL ? null : h('p', { class: 'mb-4 p-3 rounded-xl bg-amber-50 text-amber-700 text-sm', role: 'alert' }, 'API_URL belum diset dalam app/index.html. Tampal Web app URL Apps Script.'),
+      form)));
+  login.focus();
+}
+
+function viewChangePin() {
+  const forced = state.user.must_change_pin;
+  const o = pinField('old_pin', forced ? 'PIN sementara' : 'PIN semasa', 'current-password');
+  const n = pinField('new_pin', 'PIN baru (6 digit)', 'new-password');
+  const c = pinField('new_pin2', 'Sahkan PIN baru', 'new-password');
+  const err = h('p', { class: C.err, role: 'alert', hidden: true });
+  const submit = h('button', { type: 'submit', class: C.btn + ' ' + C.primary }, 'Tukar PIN');
+  const form = h('form', { class: 'space-y-4 max-w-sm', novalidate: true,
+    onsubmit: async e => {
+      e.preventDefault(); err.hidden = true;
+      if (!/^\d{6}$/.test(n.inp.value)) { err.textContent = 'PIN baru mesti 6 digit'; err.hidden = false; return; }
+      if (n.inp.value !== c.inp.value) { err.textContent = 'PIN baru dan pengesahan tak sama'; err.hidden = false; return; }
+      try {
+        await busy(submit, () => api('changePin', { old_pin: o.inp.value, new_pin: n.inp.value }));
+        state.user.must_change_pin = false; toast('PIN ditukar');
+        location.hash = state.user.role === 'Staf' ? '#/cert-saya' : '#/personel';
+      } catch (ex) { err.textContent = errText(ex); err.hidden = false; if (ex.code === 'AKAUN_DIKUNCI') endSession(errText(ex)); }
+    } }, o.el, n.el, c.el, err, submit);
+  return h('div', {}, h('h1', { class: 'text-2xl font-bold mb-1' }, 'Tukar PIN'),
+    forced ? h('p', { class: 'mb-4 p-3 rounded-xl bg-amber-50 text-amber-700 text-sm' }, 'Ini login pertama anda. Sila tukar PIN sementara sebelum teruskan.') : h('p', { class: C.muted + ' mb-4' }, 'PIN mesti 6 digit dan tak mudah diteka.'), form);
+}
+
+/* ============================================================
+   SHELL & NAVIGASI
+   ============================================================ */
+function navItems() {
+  const r = state.user.role;
+  if (r === 'Admin') return [['#/personel', 'users', 'Personel'], ['#/tetapan', 'gear', 'Tetapan']];
+  if (r === 'Lead') return [['#/personel', 'users', 'Personel']];
+  return [['#/cert-saya', 'certificate', 'Cert saya']];
+}
+
+function toggleTheme() {
+  const dark = !document.documentElement.classList.contains('dark');
+  document.documentElement.classList.toggle('dark', dark);
+  try { localStorage.setItem('ct_theme', dark ? 'dark' : 'light'); } catch (e) { /* abaikan */ }
+}
+
+function renderShell(content) {
+  const here = location.hash.split('/').slice(0, 2).join('/');
+  const items = navItems();
+  const link = (it, mobile) => h('a', { href: it[0], 'aria-current': here === it[0] ? 'page' : null,
+    class: mobile ? 'flex-1 flex flex-col items-center justify-center min-h-[56px] text-xs gap-0.5 ' + (here === it[0] ? 'text-emerald-700 font-bold' : C.muted)
+      : 'flex items-center gap-3 px-3 min-h-[44px] rounded-xl font-medium ' + (here === it[0] ? 'bg-emerald-700 text-white' : 'hover:bg-slate-100 dark:hover:bg-slate-700') }, icon(it[1], mobile ? 'text-xl' : ''), it[2]);
+  const header = h('header', { class: 'bg-slate-900 text-white' },
+    h('div', { class: 'flex items-center justify-between px-4 min-h-[56px]' },
+      h('div', { class: 'flex items-center gap-2' }, h('span', { class: 'w-1.5 h-6 bg-yellow-500 rounded' }), h('span', { class: 'font-bold' }, 'Compliance Track')),
+      h('div', { class: 'flex items-center gap-1' },
+        h('span', { class: 'hidden sm:block text-sm mr-2 text-slate-300', id: 'whoami' }, state.user.full_name + ' (' + state.user.role + ')'),
+        h('button', { type: 'button', 'aria-label': 'Tukar tema', class: 'min-w-[44px] min-h-[44px]', onclick: toggleTheme }, icon('moon')),
+        h('a', { href: '#/tukar-pin', 'aria-label': 'Tukar PIN', title: 'Tukar PIN', class: 'min-w-[44px] min-h-[44px] flex items-center justify-center' }, icon('key')),
+        h('button', { type: 'button', id: 'btn-logout', 'aria-label': 'Keluar', title: 'Keluar', class: 'min-w-[44px] min-h-[44px]',
+          onclick: async () => { try { await api('logout'); } catch (e) { /* tetap keluar */ } endSession(''); location.hash = ''; } }, icon('sign-out')))));
+  const main = h('main', { class: 'flex-1 min-w-0 p-4 sm:p-6 pb-24 lg:pb-6 max-w-[1152px] w-full mx-auto', id: 'content' }, content);
+  $('app').replaceChildren(h('div', { class: 'min-h-screen flex flex-col' }, header,
+    h('div', { class: 'flex flex-1' },
+      h('nav', { 'aria-label': 'Menu utama', class: 'hidden lg:block w-60 shrink-0 p-3 space-y-1 border-r border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800' }, items.map(i => link(i, false))),
+      main),
+    h('nav', { 'aria-label': 'Menu utama', class: 'lg:hidden fixed bottom-0 inset-x-0 flex bg-white dark:bg-slate-800 border-t border-slate-200 dark:border-slate-700 z-40' }, items.map(i => link(i, true)))));
+}
+
+const skeleton = () => h('div', { class: 'space-y-3', 'aria-busy': 'true' }, [1, 2, 3, 4].map(() => h('div', { class: 'h-14 rounded-xl bg-slate-200 dark:bg-slate-700 animate-pulse' })));
+function errorBox(e, retry) {
+  return h('div', { class: C.card + ' p-6 text-center', role: 'alert' }, h('p', { class: 'mb-3' }, errText(e) || 'Tak dapat muat data. Cuba lagi'), retry ? btn('Cuba lagi', 'secondary', { onclick: retry }) : null);
+}
+
+/* ---------- router ---------- */
+let routeSeq = 0;
+function route() {
+  if (!getToken() || !state.user) { if (getToken()) return restoreSession(); return showLogin(''); }
+  const u = state.user; const seq = ++routeSeq;
+  const parts = location.hash.replace(/^#\//, '').split('/');
+  let view = parts[0];
+  if (u.must_change_pin) view = 'tukar-pin';
+  const isStaff = u.role === 'Staf', isAdmin = u.role === 'Admin';
+  if (!view) view = isStaff ? 'cert-saya' : 'personel';
+  const slot = h('div', {}, skeleton());
+  const mount = async fn => { renderShell(slot); try { const el = await fn(); if (seq === routeSeq) slot.replaceChildren(el); } catch (e) { if (seq === routeSeq && e.code !== 'SESI_TAMAT') slot.replaceChildren(errorBox(e, route)); } };
+  if (view === 'tukar-pin') { renderShell(viewChangePin()); return; }
+  if (isStaff) { if (view !== 'cert-saya') { location.hash = '#/cert-saya'; return; } renderShell(viewStaffHome()); return; }
+  if (view === 'personel' && parts[1]) return mount(() => viewProfile(decodeURIComponent(parts[1]).toUpperCase()));
+  if (view === 'personel') return mount(() => viewPersonnelList(false));
+  if (view === 'tetapan' && isAdmin) return mount(() => viewSettings());
+  location.hash = '#/personel';
+}
+
+async function restoreSession() {
+  try { const d = await api('getMe'); state.user = d.user; route(); }
+  catch (e) { setToken(''); showLogin(e.code === 'SESI_TAMAT' ? 'Sesi tamat, login semula' : ''); }
+}
+
+/* ============================================================
+   S-08 (placeholder Fasa 4)
+   ============================================================ */
+function viewStaffHome() {
+  return h('div', {}, h('h1', { class: 'text-2xl font-bold mb-1' }, 'Cert saya'),
+    h('div', { class: C.card + ' p-6 mt-4' }, h('p', {}, 'Selamat datang, ' + state.user.full_name + '.'), h('p', { class: C.muted + ' mt-2' }, 'Kemas kini cert sendiri akan tersedia dalam fasa seterusnya. Buat masa ini anda boleh tukar PIN.'),
+      h('a', { href: '#/tukar-pin', class: C.btn + ' ' + C.secondary + ' mt-4' }, icon('key'), 'Tukar PIN')));
+}
+
+/* ============================================================
+   S-07 SENARAI PERSONEL (juga digunakan dalam S-10 tab Personel)
+   ============================================================ */
+const PAGE = 20;
+async function viewPersonnelList(settingsMode) {
+  const d = await api('listPersonnel');
+  const all = d.personnel; state.designations = [...new Set(all.map(p => p.designation).filter(Boolean))].sort();
+  const isAdmin = state.user.role === 'Admin';
+  let q = '', page = 0;
+  const listEl = h('div', { class: 'space-y-2', id: 'plist' }), pager = h('div', { class: 'flex items-center justify-between mt-3' });
+  const search = h('input', { type: 'search', id: 'psearch', placeholder: 'Cari nama, ID atau designation', 'aria-label': 'Cari personel', class: C.input });
+  function draw() {
+    const f = all.filter(p => !q || [p.full_name, p.staff_id, p.designation].join(' ').toLowerCase().includes(q));
+    const pages = Math.max(1, Math.ceil(f.length / PAGE)); if (page >= pages) page = pages - 1;
+    const rows = f.slice(page * PAGE, page * PAGE + PAGE);
+    listEl.replaceChildren(...(rows.length ? rows.map(p => personRow(p, settingsMode, reload)) : [h('div', { class: C.card + ' p-6 text-center ' + C.muted }, 'Tiada personel dijumpai')]));
+    pager.replaceChildren(h('span', { class: C.muted + ' text-sm' }, f.length + ' personel'),
+      h('div', { class: 'flex items-center gap-2' }, btn(icon('caret-left'), 'secondary', { 'aria-label': 'Sebelum', disabled: page === 0, onclick: () => { page--; draw(); } }),
+        h('span', { class: 'text-sm' }, (page + 1) + ' / ' + pages), btn(icon('caret-right'), 'secondary', { 'aria-label': 'Seterusnya', disabled: page >= pages - 1, onclick: () => { page++; draw(); } })));
+  }
+  async function reload() { route(); }
+  search.addEventListener('input', () => { q = search.value.trim().toLowerCase(); page = 0; draw(); });
+  draw();
+  const top = h('div', { class: 'flex flex-col sm:flex-row gap-3 mb-4' }, h('div', { class: 'flex-1' }, search),
+    (isAdmin && settingsMode) ? btn([icon('plus'), 'Personel baru'], 'primary', { id: 'btn-new-person', onclick: () => personModal(null, d.next_staff_id, reload) }) : null);
+  return h('div', {}, settingsMode ? null : h('h1', { class: 'text-2xl font-bold mb-4' }, 'Personel'), top, listEl, pager);
+}
+
+function personRow(p, settingsMode, reload) {
+  const inactive = p.status !== 'Aktif';
+  const left = h('a', { href: '#/personel/' + encodeURIComponent(p.staff_id), class: 'flex-1 min-w-0 block min-h-[44px]' },
+    h('div', { class: 'font-semibold truncate' }, p.full_name),
+    h('div', { class: C.muted + ' text-xs truncate' }, h('span', { class: 'mono' }, p.staff_id), ' · ', p.designation || 'Designation belum diisi', p.employer_type === 'Luar' ? ' · Luar' : ''));
+  return h('div', { class: C.card + ' p-3 flex items-center gap-3 ' + (inactive ? 'opacity-70' : '') },
+    left, inactive ? h('span', { class: 'text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-600' }, 'Tidak aktif') : null,
+    (settingsMode && state.user.role === 'Admin') ? btn(icon('pencil-simple'), 'secondary', { 'aria-label': 'Edit ' + p.full_name, onclick: () => personModal(p.staff_id, null, reload) }) : h('span', { 'aria-hidden': 'true', class: C.muted }, icon('caret-right')));
+}
+
+/* ============================================================
+   S-10 TETAPAN (Fasa 1: tab Personel sahaja)
+   ============================================================ */
+async function viewSettings() {
+  const tabs = ['Personel', 'Jenis cert', 'Rules', 'User & PIN', 'Config'];
+  const list = await viewPersonnelList(true);
+  return h('div', {}, h('h1', { class: 'text-2xl font-bold mb-3' }, 'Tetapan'),
+    h('div', { class: 'flex gap-1 overflow-x-auto mb-4 border-b border-slate-200 dark:border-slate-700', role: 'tablist' },
+      tabs.map((t, i) => h('button', { type: 'button', role: 'tab', 'aria-selected': i === 0 ? 'true' : 'false', disabled: i !== 0, title: i === 0 ? null : 'Tersedia dalam Fasa 4',
+        class: 'px-4 min-h-[44px] whitespace-nowrap font-semibold border-b-2 ' + (i === 0 ? 'border-emerald-700 text-emerald-700' : 'border-transparent opacity-40 cursor-not-allowed') }, t))),
+    list);
+}
+
+/* ---------- borang personel ---------- */
+function field(label, input, id, hint) { return h('div', {}, h('label', { for: id, class: C.label }, label), input, hint ? h('p', { class: C.muted + ' text-xs mt-1' }, hint) : null); }
+function select(id, options, value) {
+  const s = h('select', { id, class: C.input }, options.map(o => h('option', { value: o }, o)));
+  s.value = value; return s;
+}
+
+async function personModal(staffId, nextId, onSaved) {
+  const editing = !!staffId;
+  let cur = null, priv = { ic_no: '', phone: '' };
+  const body = h('div', { class: 'p-4' }, h('span', { class: C.muted }, h('span', { class: 'spin' }, icon('spinner-gap')), ' Memuatkan...'));
+  const m = openModal(editing ? 'Edit personel' : 'Personel baru', body);
+  try {
+    if (editing) { const d = await api('getPersonnel', { staff_id: staffId, include_private: true }); cur = d.personnel; priv = d.private || priv; }
+  } catch (e) { body.replaceChildren(h('p', { class: C.err, role: 'alert' }, errText(e))); return; }
+
+  const f = {
+    staff_id: h('input', { id: 'f_staff_id', class: C.input + ' mono', value: cur ? cur.staff_id : (nextId || ''), readonly: editing, maxlength: '20' }),
+    full_name: h('input', { id: 'f_full_name', class: C.input, value: cur ? cur.full_name : '', maxlength: '120', required: true }),
+    designation: h('input', { id: 'f_designation', class: C.input, value: cur ? cur.designation : '', list: 'dl_designation', maxlength: '100' }),
+    employer_type: select('f_employer_type', ['Voltake', 'Luar'], cur ? cur.employer_type : 'Voltake'),
+    employer_name: h('input', { id: 'f_employer_name', class: C.input, value: cur ? cur.employer_name : '', maxlength: '120' }),
+    status: select('f_status', ['Aktif', 'Tidak aktif'], cur ? cur.status : 'Aktif'),
+    email: h('input', { id: 'f_email', type: 'email', class: C.input, value: cur ? cur.email : '', maxlength: '120' }),
+    ic_no: h('input', { id: 'f_ic_no', class: C.input + ' mono', value: priv.ic_no, inputmode: 'numeric', placeholder: '######-##-####', maxlength: '14', autocomplete: 'off' }),
+    phone: h('input', { id: 'f_phone', type: 'tel', class: C.input + ' mono', value: priv.phone, placeholder: '0123456789', maxlength: '25', autocomplete: 'off' }),
+    notes: h('textarea', { id: 'f_notes', class: C.input + ' py-2', rows: '2', maxlength: '500' })
+  };
+  f.notes.value = cur ? cur.notes : '';
+  const err = h('p', { class: C.err, role: 'alert', hidden: true });
+  const submit = h('button', { type: 'submit', class: C.btn + ' ' + C.primary }, 'Simpan');
+  const form = h('form', { class: 'p-4 space-y-3', novalidate: true,
+    onsubmit: async e => {
+      e.preventDefault(); err.hidden = true;
+      const p = { mode: editing ? 'update' : 'create', staff_id: f.staff_id.value, full_name: f.full_name.value, designation: f.designation.value, employer_type: f.employer_type.value,
+        employer_name: f.employer_name.value, status: f.status.value, email: f.email.value, notes: f.notes.value };
+      if (!editing || f.ic_no.value !== priv.ic_no) p.ic_no = f.ic_no.value;       // data peribadi hanya dihantar bila diubah
+      if (!editing || f.phone.value !== priv.phone) p.phone = f.phone.value;
+      try { await busy(submit, () => api('savePersonnel', p)); toast('Personel disimpan'); m.close(); onSaved(); }
+      catch (ex) { err.textContent = errText(ex); err.hidden = false; }
+    } },
+    h('datalist', { id: 'dl_designation' }, state.designations.map(d => h('option', { value: d }))),
+    h('div', { class: 'grid sm:grid-cols-2 gap-3' }, field('ID staf', f.staff_id, 'f_staff_id', editing ? null : 'Format VES###. Dijana automatik jika dikosongkan'), field('Nama penuh', f.full_name, 'f_full_name')),
+    field('Designation', f.designation, 'f_designation'),
+    h('div', { class: 'grid sm:grid-cols-2 gap-3' }, field('Jenis majikan', f.employer_type, 'f_employer_type'), field('Nama majikan', f.employer_name, 'f_employer_name', 'Isi jika Luar')),
+    h('div', { class: 'grid sm:grid-cols-2 gap-3' }, field('Status', f.status, 'f_status'), field('Email', f.email, 'f_email')),
+    h('fieldset', { class: 'rounded-xl border border-amber-200 bg-amber-50 dark:bg-slate-900 dark:border-slate-600 p-3 space-y-3' },
+      h('legend', { class: 'px-1 text-sm font-semibold text-amber-700' }, 'Data peribadi (hanya admin, dilog)'),
+      h('div', { class: 'grid sm:grid-cols-2 gap-3' }, field('No. IC', f.ic_no, 'f_ic_no'), field('No. telefon', f.phone, 'f_phone', 'Untuk pautan WhatsApp'))),
+    field('Catatan', f.notes, 'f_notes'), err,
+    h('div', { class: 'flex justify-end gap-2 pt-1' }, btn('Batal', 'secondary', { onclick: () => m.close() }), submit));
+  body.replaceChildren(form);
+  f.full_name.focus();
+}
+
+/* ============================================================
+   S-07 PROFIL PERSONEL & CERT
+   ============================================================ */
+async function viewProfile(staffId) {
+  const isAdmin = state.user.role === 'Admin';
+  const [pl, cl, types] = await Promise.all([api('listPersonnel'), api('listCerts', { staff_id: staffId }), loadCertTypes()]);
+  const p = pl.personnel.find(x => x.staff_id === staffId);
+  if (!p) return h('div', {}, h('a', { href: '#/personel', class: C.muted }, '← Senarai personel'), h('div', { class: C.card + ' p-6 mt-3', role: 'alert' }, 'Personel tak dijumpai.'));
+  const typeMap = Object.fromEntries(types.map(t => [t.type_code, t]));
+  const certs = cl.certs.slice().sort((a, b) => ((typeMap[a.type_code] || {}).pack_order || 99) - ((typeMap[b.type_code] || {}).pack_order || 99) || String(b.expiry_date).localeCompare(String(a.expiry_date)));
+  const reload = () => route();
+  const info = [['ID staf', h('span', { class: 'mono' }, p.staff_id)], ['Designation', p.designation || '-'], ['Majikan', p.employer_type === 'Luar' ? (p.employer_name || 'Luar') : 'Voltake'], ['Status', p.status]];
+  if (isAdmin) { info.push(['Email', p.email || '-']); info.push(['Catatan', p.notes || '-']); }
+  const certRows = certs.length ? certs.map(c => {
+    const t = typeMap[c.type_code] || { type_name: c.type_code };
+    const muted = c.record_status === 'Superseded' || c.record_status === 'Rejected';
+    return h('div', { class: C.card + ' p-3 ' + (muted ? 'opacity-70' : ''), 'data-cert': c.cert_id },
+      h('div', { class: 'flex flex-wrap items-center gap-2 justify-between' },
+        h('div', { class: 'font-semibold' }, t.type_name), chip(c.record_status)),
+      h('div', { class: 'mt-1 grid sm:grid-cols-3 gap-x-4 gap-y-1 text-sm' },
+        h('div', {}, h('span', { class: C.muted }, 'No: '), h('span', { class: 'mono' }, c.cert_no || '-')),
+        h('div', {}, h('span', { class: C.muted }, 'Tamat: '), h('span', { class: 'mono' }, t.has_expiry === false ? 'Tiada' : fmtDate(c.expiry_date))),
+        c.detail ? h('div', {}, h('span', { class: C.muted }, 'Butiran: '), c.detail) : null),
+      c.reject_reason ? h('p', { class: C.err }, 'Sebab ditolak: ' + c.reject_reason) : null,
+      c.remarks ? h('p', { class: C.muted + ' text-xs mt-1' }, c.remarks) : null,
+      h('div', { class: 'mt-2 flex gap-2' },
+        c.has_file ? btn([icon('file-image'), 'Lihat fail'], 'secondary', { onclick: () => viewFile(c.cert_id, t.type_name + ' · ' + p.full_name) }) : h('span', { class: C.muted + ' text-sm self-center' }, 'Tiada fail'),
+        isAdmin ? btn([icon('pencil-simple'), 'Edit'], 'secondary', { onclick: () => certModal(p, types, c, reload) }) : null));
+  }) : [h('div', { class: C.card + ' p-6 text-center ' + C.muted }, 'Belum ada cert.' + (isAdmin ? ' Tekan Tambah cert.' : ''))];
+  return h('div', {},
+    h('a', { href: '#/personel', class: C.muted + ' inline-flex items-center gap-1 min-h-[44px]' }, icon('arrow-left'), 'Senarai personel'),
+    h('div', { class: 'flex flex-wrap items-start justify-between gap-3 mb-4' },
+      h('h1', { class: 'text-2xl font-bold' }, p.full_name),
+      isAdmin ? h('div', { class: 'flex gap-2' }, btn([icon('plus'), 'Tambah cert'], 'primary', { id: 'btn-add-cert', onclick: () => certModal(p, types, null, reload) }), btn(icon('pencil-simple'), 'secondary', { 'aria-label': 'Edit personel', onclick: () => personModal(p.staff_id, null, reload) })) : null),
+    h('dl', { class: C.card + ' p-4 grid sm:grid-cols-2 gap-3 mb-6' }, info.map(([k, v]) => h('div', {}, h('dt', { class: C.muted + ' text-xs' }, k), h('dd', { class: 'font-medium' }, v)))),
+    h('h2', { class: 'text-lg font-bold mb-3' }, 'Cert'), h('div', { class: 'space-y-3' }, certRows));
+}
+
+/* ---------- borang cert ---------- */
+function certModal(person, types, cert, onSaved) {
+  const editing = !!cert;
+  const typeSel = h('select', { id: 'c_type', class: C.input, disabled: editing }, types.map(t => h('option', { value: t.type_code }, t.type_name)));
+  typeSel.value = editing ? cert.type_code : (types.find(t => !t.is_sensitive) || types[0]).type_code;   // lalai: jenis biasa, bukan IC
+  const no = h('input', { id: 'c_no', class: C.input + ' mono', value: cert ? cert.cert_no : '', maxlength: '60', autocomplete: 'off' });
+  const issue = h('input', { id: 'c_issue', type: 'date', class: C.input, value: cert ? cert.issue_date : '' });
+  const expiry = h('input', { id: 'c_expiry', type: 'date', class: C.input, value: cert ? cert.expiry_date : '' });
+  const detail = h('input', { id: 'c_detail', class: C.input, value: cert ? cert.detail : '', maxlength: '200', placeholder: 'Contoh: Pengurus Projek Binaan, trade 522' });
+  const remarks = h('input', { id: 'c_remarks', class: C.input, value: cert ? cert.remarks : '', maxlength: '300' });
+  const file = h('input', { id: 'c_file', type: 'file', accept: 'image/jpeg,image/png,application/pdf', class: C.input + ' py-2' });
+  const fileNote = h('p', { class: C.muted + ' text-xs mt-1' }, 'JPG, PNG atau PDF (maksimum 3 MB). Imej dikecilkan automatik.' + (editing && cert.has_file ? ' Pilih fail baru untuk ganti.' : ''));
+  const noWrap = field('Nombor cert', no, 'c_no'), expWrap = field('Tarikh tamat', expiry, 'c_expiry');
+  const err = h('p', { class: C.err, role: 'alert', hidden: true });
+  const submit = h('button', { type: 'submit', class: C.btn + ' ' + C.primary }, 'Simpan');
+  const sync = () => { const t = types.find(x => x.type_code === typeSel.value) || {}; noWrap.hidden = t.has_number === false; expWrap.hidden = t.has_expiry === false; };
+  typeSel.addEventListener('change', sync); sync();
+  const m = openModal((editing ? 'Edit cert' : 'Tambah cert') + ' · ' + person.full_name, h('form', { class: 'p-4 space-y-3', novalidate: true,
+    onsubmit: async e => {
+      e.preventDefault(); err.hidden = true;
+      try {
+        const up = await prepareFile(file.files[0]);
+        const p = { cert_no: no.value, issue_date: issue.value, expiry_date: expiry.value, detail: detail.value, remarks: remarks.value };
+        if (editing) p.cert_id = cert.cert_id; else { p.staff_id = person.staff_id; p.type_code = typeSel.value; }
+        if (up) p.file = up;
+        await busy(submit, () => api('saveCert', p)); toast('Cert disimpan'); m.close(); onSaved();
+      } catch (ex) { err.textContent = errText(ex); err.hidden = false; }
+    } },
+    field('Jenis cert', typeSel, 'c_type'), noWrap,
+    h('div', { class: 'grid sm:grid-cols-2 gap-3' }, field('Tarikh keluaran', issue, 'c_issue'), expWrap),
+    field('Butiran', detail, 'c_detail'), field('Fail cert', file, 'c_file'), fileNote, field('Catatan', remarks, 'c_remarks'), err,
+    h('div', { class: 'flex justify-end gap-2 pt-1' }, btn('Batal', 'secondary', { onclick: () => m.close() }), submit)));
+}
+
+/* ---------- mula ---------- */
+(function init() {
+  try { if (localStorage.getItem('ct_theme') === 'dark') document.documentElement.classList.add('dark'); } catch (e) { /* abaikan */ }
+  window.addEventListener('hashchange', () => { if (state.user) { closeAllModals(); route(); } });
+  if (getToken()) restoreSession(); else showLogin('');
+})();
+</script>
+</body>
+</html>

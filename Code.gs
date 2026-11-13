@@ -2,14 +2,14 @@
  * Compliance Track - Code.gs
  * Voltake Energy Services Sdn Bhd
  *
- * Status: FASA 0 (setup, migrasi, healthCheck, jana PIN staf).
- * Router doPost / login / readiness / pack dibina dalam fasa 1 dan seterusnya.
+ * Status: FASA 1 (Fasa 0 + router doPost, login/PIN/lockout, personel, cert, fail).
+ * Readiness / pack / staf self-service / dashboard dibina dalam fasa 2 dan seterusnya.
  *
  * Skrip container-bound pada spreadsheet Compliance_DB (dan Compliance_DB_TEST).
  * Rujukan skema: BSD seksyen 3. Setup: BSD seksyen 6. Migrasi: BSD seksyen 7.
  */
 
-var APP = { VERSION: '0.1.0-fasa0', TZ: 'Asia/Kuala_Lumpur' };
+var APP = { VERSION: '0.2.0-fasa1', TZ: 'Asia/Kuala_Lumpur' };
 
 var DATE_FMT = 'dd/MM/yyyy';
 var DATETIME_FMT = 'dd/MM/yyyy HH:mm';
@@ -94,6 +94,7 @@ function onOpen() {
     .addItem('2. Import data lama', 'migrateOldData')
     .addItem('3. Jana PIN staf', 'generateStaffPins')
     .addItem('4. Semak kesihatan', 'healthCheck')
+    .addItem('5. Tambah user Lead/Admin', 'addUserFromMenu')
     .addToUi();
 }
 
@@ -980,4 +981,455 @@ function runHealthCheck_() {
     CONFIG_SEED.forEach(function (p) { if (keys.indexOf(p[0]) < 0) errors.push('Config: key "' + p[0] + '" tiada'); });
   }
   return { ok: errors.length === 0, errors: errors, info: info };
+}
+
+/* ================================================================== */
+/* FASA 1: API (router, auth, personel, cert, fail)                    */
+/* Rujukan: TRD seksyen 5-6, BSD seksyen 4-5                           */
+/* ================================================================== */
+var SESSION_TTL_ = 21600;           // 6 jam, had CacheService
+var MAX_FAILED_ = 5;
+var LOCK_MINUTES_ = 15;
+var MAX_FILE_BYTES_ = 3 * 1024 * 1024;
+var MAX_B64_CHARS_ = 4400000;       // ~3.3 MB binari
+var ALLOWED_MIME_ = { 'image/jpeg': 'jpg', 'image/png': 'png', 'application/pdf': 'pdf' };
+
+var PERS_FIELDS_LEAD_ = ['staff_id', 'full_name', 'designation', 'employer_type', 'employer_name', 'status'];
+var PERS_FIELDS_ADMIN_ = PERS_FIELDS_LEAD_.concat(['email', 'notes', 'created_at', 'updated_at']);
+var CERT_FIELDS_ = ['cert_id', 'staff_id', 'type_code', 'cert_no', 'detail', 'issue_date', 'expiry_date', 'file_name', 'record_status', 'reject_reason', 'submitted_by', 'submitted_at', 'verified_by', 'verified_at', 'remarks'];
+
+function AppError_(code, message) { var e = new Error(message); e.appCode = code; return e; }
+function isDate_(v) { return Object.prototype.toString.call(v) === '[object Date]'; }
+
+/* ---------------- Router ---------------- */
+function doGet() { return json_({ ok: true, app: 'Compliance Track', version: APP.VERSION }); }
+
+function json_(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
+
+// action -> { roles: null (awam) | [..], fn, allowMustChange }
+var ACTIONS_ = {
+  login:          { roles: null, fn: apiLogin_ },
+  logout:         { roles: ['Admin', 'Lead', 'Staf'], fn: apiLogout_, allowMustChange: true },
+  getMe:          { roles: ['Admin', 'Lead', 'Staf'], fn: apiGetMe_, allowMustChange: true },
+  changePin:      { roles: ['Admin', 'Lead', 'Staf'], fn: apiChangePin_, allowMustChange: true },
+  listCertTypes:  { roles: ['Admin', 'Lead', 'Staf'], fn: apiListCertTypes_ },
+  listPersonnel:  { roles: ['Admin', 'Lead'], fn: apiListPersonnel_ },
+  getPersonnel:   { roles: ['Admin'], fn: apiGetPersonnel_ },
+  savePersonnel:  { roles: ['Admin'], fn: apiSavePersonnel_ },
+  listCerts:      { roles: ['Admin', 'Lead'], fn: apiListCerts_ },
+  saveCert:       { roles: ['Admin'], fn: apiSaveCert_ },
+  getCertFile:    { roles: ['Admin', 'Lead', 'Staf'], fn: apiGetCertFile_ }
+};
+
+function doPost(e) {
+  var res;
+  try {
+    var raw = e && e.postData && e.postData.contents;
+    if (!raw || raw.length > 6000000) throw AppError_('PERMINTAAN_SALAH', 'Permintaan tak sah');
+    var req;
+    try { req = JSON.parse(raw); } catch (x) { throw AppError_('PERMINTAAN_SALAH', 'Permintaan tak sah'); }
+    var def = Object.prototype.hasOwnProperty.call(ACTIONS_, req.action) ? ACTIONS_[req.action] : null;
+    if (!def) throw AppError_('ACTION_TIADA', 'Action tak dikenali');
+    var ctx = { session: null, params: (req.params && typeof req.params === 'object' && !Array.isArray(req.params)) ? req.params : {} };
+    if (def.roles) ctx.session = requireRole_(req.token, def.roles, !!def.allowMustChange, req.action);
+    res = { ok: true, data: def.fn(ctx) };
+  } catch (err) {
+    if (err && err.appCode) res = { ok: false, code: err.appCode, error: err.message };
+    else { Logger.log('RALAT: ' + (err && err.stack ? err.stack : err)); res = { ok: false, code: 'RALAT_SERVER', error: 'Ralat server. Cuba lagi' }; }
+  }
+  return json_(res);
+}
+
+/* ---------------- Sesi & role ---------------- */
+function tokenKey_(token) { return 'tok_' + hashPin_('', token); }
+
+function newToken_() { return (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, ''); }
+
+// Role dan status aktif dibaca semula daripada Users setiap request (bukan daripada cache)
+function requireRole_(token, roles, allowMustChange, actionName) {
+  if (typeof token !== 'string' || token.length < 32 || token.length > 200) throw AppError_('SESI_TAMAT', 'Sesi tamat, login semula');
+  var cache = CacheService.getScriptCache();
+  var key = tokenKey_(token);
+  var raw = cache.get(key);
+  if (!raw) throw AppError_('SESI_TAMAT', 'Sesi tamat, login semula');
+  var uid = JSON.parse(raw).user_id;
+  var user = readTable_('Users').filter(function (u) { return u.user_id === uid; })[0];
+  if (!user || !isTrue_(user.active)) { cache.remove(key); throw AppError_('SESI_TAMAT', 'Sesi tamat, login semula'); }
+  var s = { user_id: user.user_id, login_id: user.login_id, full_name: user.full_name, role: user.role, staff_id: String(user.staff_id || ''), must_change_pin: isTrue_(user.must_change_pin), key: key };
+  if (s.must_change_pin && !allowMustChange) throw AppError_('PIN_PERLU_TUKAR', 'Sila tukar PIN dahulu');
+  if (roles.indexOf(s.role) < 0) {
+    audit_(s.user_id, 'akses_ditolak', actionName || '', 'role ' + s.role);
+    throw AppError_('TIDAK_DIBENARKAN', 'Anda tak dibenarkan');
+  }
+  return s;
+}
+
+function userInfo_(s) { return { user_id: s.user_id, full_name: s.full_name, role: s.role, staff_id: s.staff_id, login_id: s.login_id, must_change_pin: s.must_change_pin }; }
+
+function lockedNow_(user) { return isDate_(user.locked_until) && user.locked_until.getTime() > Date.now(); }
+
+// Tambah kiraan gagal; kunci selepas 5. Mesti dalam withLock_.
+function registerFail_(user) {
+  var n = (Number(user.failed_count) || 0) + 1;
+  if (n >= MAX_FAILED_) {
+    updateRowCells_('Users', user._row, { failed_count: 0, locked_until: new Date(Date.now() + LOCK_MINUTES_ * 60000) });
+    audit_(user.user_id, 'akaun_dikunci', user.user_id, MAX_FAILED_ + ' PIN salah');
+    return true;
+  }
+  updateRowCells_('Users', user._row, { failed_count: n });
+  return false;
+}
+
+function pinOk_(user, pin) { return hashPin_(String(user.salt), String(pin)) === String(user.pin_hash); }
+
+function apiLogin_(ctx) {
+  var p = ctx.params;
+  var loginId = String(p.login_id === undefined || p.login_id === null ? '' : p.login_id).trim().toLowerCase();
+  var pin = String(p.pin === undefined || p.pin === null ? '' : p.pin);
+  var generic = AppError_('LOGIN_GAGAL', 'Email atau PIN salah');
+  var locked = AppError_('AKAUN_DIKUNCI', 'Akaun dikunci ' + LOCK_MINUTES_ + ' minit. Cuba lagi kemudian');
+  if (!loginId || loginId.length > 200 || !/^\d{6}$/.test(pin)) throw generic;
+
+  return withLock_(function () {
+    var user = readTable_('Users').filter(function (u) { return String(u.login_id).toLowerCase() === loginId; })[0];
+    if (!user || !isTrue_(user.active)) { audit_('SYSTEM', 'login_gagal', loginId.substring(0, 60), 'pengguna tiada/tak aktif'); throw generic; }
+    if (lockedNow_(user)) { audit_(user.user_id, 'login_gagal', user.user_id, 'akaun dikunci'); throw locked; }
+    if (!pinOk_(user, pin)) {
+      var nowLocked = registerFail_(user);
+      audit_(user.user_id, 'login_gagal', user.user_id, 'PIN salah');
+      throw nowLocked ? locked : generic;
+    }
+    updateRowCells_('Users', user._row, { failed_count: 0, locked_until: '', last_login: new Date() });
+    var token = newToken_();
+    CacheService.getScriptCache().put(tokenKey_(token), JSON.stringify({ user_id: user.user_id }), SESSION_TTL_);
+    audit_(user.user_id, 'login', user.user_id, user.role);
+    var s = { user_id: user.user_id, login_id: user.login_id, full_name: user.full_name, role: user.role, staff_id: String(user.staff_id || ''), must_change_pin: isTrue_(user.must_change_pin) };
+    return { token: token, user: userInfo_(s), expires_in: SESSION_TTL_ };
+  });
+}
+
+function apiLogout_(ctx) { CacheService.getScriptCache().remove(ctx.session.key); return { done: true }; }
+function apiGetMe_(ctx) { return { user: userInfo_(ctx.session) }; }
+
+function apiChangePin_(ctx) {
+  var oldPin = String(ctx.params.old_pin === undefined ? '' : ctx.params.old_pin);
+  var newPin = String(ctx.params.new_pin === undefined ? '' : ctx.params.new_pin);
+  if (!/^\d{6}$/.test(newPin)) throw AppError_('VALIDASI', 'PIN baru mesti 6 digit');
+  if (isWeakPin_(newPin)) throw AppError_('VALIDASI', 'PIN baru terlalu mudah diteka');
+  if (newPin === oldPin) throw AppError_('VALIDASI', 'PIN baru mesti berbeza daripada PIN lama');
+  return withLock_(function () {
+    var user = readTable_('Users').filter(function (u) { return u.user_id === ctx.session.user_id; })[0];
+    if (!user) throw AppError_('SESI_TAMAT', 'Sesi tamat, login semula');
+    if (lockedNow_(user)) throw AppError_('AKAUN_DIKUNCI', 'Akaun dikunci ' + LOCK_MINUTES_ + ' minit. Cuba lagi kemudian');
+    if (!pinOk_(user, oldPin)) {
+      var nowLocked = registerFail_(user);
+      throw AppError_(nowLocked ? 'AKAUN_DIKUNCI' : 'PIN_LAMA_SALAH', nowLocked ? 'Akaun dikunci ' + LOCK_MINUTES_ + ' minit' : 'PIN lama salah');
+    }
+    var salt = newSalt_();
+    updateRowCells_('Users', user._row, { pin_hash: hashPin_(salt, newPin), salt: salt, must_change_pin: false, failed_count: 0 });
+    audit_(user.user_id, 'change_pin', user.user_id, '');
+    return { done: true };
+  });
+}
+
+/* ---------------- Util data ---------------- */
+function updateRowCells_(tab, rowNum, obj) {
+  var sh = getSheet_(tab), hdr = headersOf_(tab);
+  Object.keys(obj).forEach(function (k) {
+    var idx = hdr.indexOf(k);
+    if (idx < 0) throw new Error('Medan ' + k + ' tiada dalam ' + tab);
+    sh.getRange(rowNum, idx + 1).setValue(safeCell_(obj[k]));
+  });
+}
+
+function typeOf_(tab, field) {
+  var c = SCHEMA[tab].filter(function (x) { return x[0] === field; })[0];
+  return c ? c[1] : 't';
+}
+
+// Date -> teks supaya selamat dalam JSON: tarikh yyyy-MM-dd, datetime yyyy-MM-dd HH:mm
+function ser_(tab, row, fields) {
+  var out = {};
+  fields.forEach(function (f) {
+    var v = row[f];
+    if (isDate_(v)) v = Utilities.formatDate(v, APP.TZ, typeOf_(tab, f) === 'dt' ? 'yyyy-MM-dd HH:mm' : 'yyyy-MM-dd');
+    out[f] = (v === undefined || v === null) ? '' : v;
+  });
+  return out;
+}
+
+function vStr_(v, label, max, required) {
+  v = (v === undefined || v === null) ? '' : String(v);
+  v = v.replace(/[\u0000-\u001F\u007F​]/g, ' ').replace(/ /g, ' ').replace(/\s+/g, ' ').trim();
+  if (required && !v) throw AppError_('VALIDASI', label + ' wajib diisi');
+  if (v.length > max) throw AppError_('VALIDASI', label + ' terlalu panjang (maksimum ' + max + ' aksara)');
+  return v;
+}
+
+function vEnum_(v, label, list, dflt) {
+  v = vStr_(v, label, 40, false) || dflt;
+  if (list.indexOf(v) < 0) throw AppError_('VALIDASI', label + ' tak sah');
+  return v;
+}
+
+function vDate_(v, label, required) {
+  v = vStr_(v, label, 20, false);
+  if (!v) { if (required) throw AppError_('VALIDASI', label + ' wajib diisi'); return null; }
+  var r = parseDateAny_(v);
+  if (r.state !== 'ok') throw AppError_('VALIDASI', label + ' bukan tarikh yang sah');
+  return r.date;
+}
+
+function normIc_(v) {
+  var d = String(v).replace(/[\s-]/g, '');
+  if (!/^\d{12}$/.test(d)) throw AppError_('VALIDASI', 'Format IC mesti ######-##-####');
+  return d.substring(0, 6) + '-' + d.substring(6, 8) + '-' + d.substring(8);
+}
+
+function normPhone_(v) {
+  var d = String(v).replace(/[\s\-()+]/g, '');
+  if (!/^\d+$/.test(d)) throw AppError_('VALIDASI', 'No. telefon tak sah');
+  if (d.charAt(0) === '0') d = '6' + d;
+  if (!/^60\d{8,10}$/.test(d)) throw AppError_('VALIDASI', 'No. telefon mesti nombor Malaysia (contoh 0123456789)');
+  return d;
+}
+
+function certTypeMap_() {
+  var m = {};
+  readTable_('Cert_Types').forEach(function (t) { m[t.type_code] = t; });
+  return m;
+}
+
+/* ---------------- Cert_Types ---------------- */
+function apiListCertTypes_(ctx) {
+  var types = readTable_('Cert_Types').filter(function (t) { return isTrue_(t.active); });
+  if (ctx.session.role !== 'Admin') types = types.filter(function (t) { return !isTrue_(t.is_sensitive); }); // jenis IC tak didedah kepada Lead/Staf
+  types.sort(function (a, b) { return Number(a.pack_order) - Number(b.pack_order); });
+  return { cert_types: types.map(function (t) { return { type_code: t.type_code, type_name: t.type_name, issuer: t.issuer, has_number: isTrue_(t.has_number), has_expiry: isTrue_(t.has_expiry), is_sensitive: isTrue_(t.is_sensitive), pack_order: Number(t.pack_order) }; }) };
+}
+
+/* ---------------- Personel ---------------- */
+function apiListPersonnel_(ctx) {
+  var admin = ctx.session.role === 'Admin';
+  var rows = readTable_('Personnel');
+  if (!admin) rows = rows.filter(function (p) { return p.status === 'Aktif'; });
+  rows.sort(function (a, b) { return String(a.full_name).localeCompare(String(b.full_name)); });
+  var out = { personnel: rows.map(function (p) { return ser_('Personnel', p, admin ? PERS_FIELDS_ADMIN_ : PERS_FIELDS_LEAD_); }) };
+  if (admin) out.next_staff_id = nextStaffId_(readTable_('Personnel'));
+  return out;
+}
+
+function apiGetPersonnel_(ctx) {
+  var id = vStr_(ctx.params.staff_id, 'staff_id', 20, true).toUpperCase();
+  var p = readTable_('Personnel').filter(function (x) { return x.staff_id === id; })[0];
+  if (!p) throw AppError_('TIADA', 'Personel tak dijumpai');
+  var out = { personnel: ser_('Personnel', p, PERS_FIELDS_ADMIN_) };
+  if (ctx.params.include_private === true) {
+    var pr = readTable_('Personnel_Private').filter(function (x) { return x.staff_id === id; })[0] || {};
+    out.private = { ic_no: pr.ic_no || '', phone: pr.phone || '' };
+    if (out.private.ic_no) audit_(ctx.session.user_id, 'view_ic', id, 'Personnel_Private');
+  }
+  return out;
+}
+
+function apiSavePersonnel_(ctx) {
+  var p = ctx.params;
+  var create = p.mode === 'create';
+  return withLock_(function () {
+    var all = readTable_('Personnel');
+    var id = vStr_(p.staff_id, 'staff_id', 20, false).toUpperCase();
+    if (create && !id) id = nextStaffId_(all);
+    if (!/^VES\d{3,}$/.test(id)) throw AppError_('VALIDASI', 'ID staf mesti format VES### (contoh VES007)');
+    var existing = all.filter(function (x) { return x.staff_id === id; })[0];
+    if (create && existing) throw AppError_('VALIDASI', 'ID staf ' + id + ' sudah wujud');
+    if (!create && !existing) throw AppError_('TIADA', 'Personel tak dijumpai');
+
+    var employerType = vEnum_(p.employer_type, 'Jenis majikan', ENUMS['Personnel.employer_type'], existing ? existing.employer_type : 'Voltake');
+    var employerName = vStr_(p.employer_name, 'Nama majikan', 120, false);
+    if (!employerName && employerType === 'Voltake') employerName = COMPANY_NAME;
+    var email = vStr_(p.email, 'Email', 120, false).toLowerCase();
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw AppError_('VALIDASI', 'Format email tak sah');
+    var rec = {
+      staff_id: id,
+      full_name: vStr_(p.full_name, 'Nama penuh', 120, true).toUpperCase(),
+      designation: vStr_(p.designation, 'Designation', 100, false).toUpperCase(),
+      employer_type: employerType,
+      employer_name: employerName,
+      email: email,
+      status: vEnum_(p.status, 'Status', ENUMS['Personnel.status'], existing ? existing.status : 'Aktif'),
+      notes: vStr_(p.notes, 'Catatan', 500, false),
+      updated_at: new Date()
+    };
+
+    // Data peribadi: hanya diubah bila medan dihantar
+    var priv = readTable_('Personnel_Private');
+    var prow = priv.filter(function (x) { return x.staff_id === id; })[0];
+    var ic, phone;
+    if (p.ic_no !== undefined) {
+      var rawIc = vStr_(p.ic_no, 'IC', 20, false);
+      ic = rawIc ? normIc_(rawIc) : '';
+      if (ic && priv.some(function (x) { return x.ic_no === ic && x.staff_id !== id; })) throw AppError_('VALIDASI', 'No. IC ini sudah didaftarkan untuk personel lain');
+    }
+    if (p.phone !== undefined) {
+      var rawPh = vStr_(p.phone, 'Telefon', 25, false);
+      phone = rawPh ? normPhone_(rawPh) : '';
+    }
+
+    if (create) { rec.created_at = new Date(); appendObjects_('Personnel', [rec]); }
+    else updateRowCells_('Personnel', existing._row, rec);
+
+    if (ic !== undefined || phone !== undefined) {
+      var privRec = { staff_id: id, ic_no: ic !== undefined ? ic : (prow ? prow.ic_no : ''), phone: phone !== undefined ? phone : (prow ? prow.phone : ''), updated_at: new Date() };
+      if (prow) updateRowCells_('Personnel_Private', prow._row, privRec);
+      else if (privRec.ic_no || privRec.phone) appendObjects_('Personnel_Private', [privRec]);
+    }
+    audit_(ctx.session.user_id, 'save_personnel', id, (create ? 'baru' : 'kemas kini') + (ic !== undefined || phone !== undefined ? ' (data peribadi diubah)' : ''));
+    return { staff_id: id };
+  });
+}
+
+/* ---------------- Cert ---------------- */
+function apiListCerts_(ctx) {
+  var admin = ctx.session.role === 'Admin';
+  var ids = null;
+  if (ctx.params.staff_ids !== undefined) {
+    if (!Array.isArray(ctx.params.staff_ids) || ctx.params.staff_ids.length > 100) throw AppError_('VALIDASI', 'staff_ids tak sah');
+    ids = ctx.params.staff_ids.map(function (x) { return String(x).toUpperCase(); });
+  } else if (ctx.params.staff_id !== undefined) ids = [String(ctx.params.staff_id).toUpperCase()];
+  var types = certTypeMap_();
+  var rows = readTable_('Certs');
+  if (ids) rows = rows.filter(function (c) { return ids.indexOf(c.staff_id) >= 0; });
+  if (!admin) {
+    rows = rows.filter(function (c) {
+      var t = types[c.type_code];
+      return (c.record_status === 'Verified' || c.record_status === 'Pending') && t && !isTrue_(t.is_sensitive);
+    });
+  }
+  return { certs: rows.map(function (c) { var o = ser_('Certs', c, CERT_FIELDS_); o.has_file = !!c.file_id; if (!admin) { o.reject_reason = ''; } return o; }) };
+}
+
+function certFolder_(staffId) {
+  var rootId = getConfig_('drive_root_folder_id');
+  if (!rootId) throw AppError_('RALAT_SERVER', 'Folder Drive belum disetup');
+  var certs = findOrCreateFolder_(DriveApp.getFolderById(rootId), 'Certs').folder;
+  return findOrCreateFolder_(certs, staffId).folder;
+}
+
+function sniffMime_(bytes) {
+  var b = function (i) { return bytes[i] & 0xff; };
+  if (bytes.length > 3 && b(0) === 0xFF && b(1) === 0xD8 && b(2) === 0xFF) return 'image/jpeg';
+  if (bytes.length > 7 && b(0) === 0x89 && b(1) === 0x50 && b(2) === 0x4E && b(3) === 0x47) return 'image/png';
+  if (bytes.length > 4 && b(0) === 0x25 && b(1) === 0x50 && b(2) === 0x44 && b(3) === 0x46) return 'application/pdf';
+  return '';
+}
+
+// Sahkan fail: jenis dibenarkan, saiz, dan kandungan sebenar sepadan jenis
+function decodeUpload_(file) {
+  if (!file || typeof file !== 'object') throw AppError_('VALIDASI', 'Fail tak sah');
+  var mime = String(file.mime || '');
+  if (!Object.prototype.hasOwnProperty.call(ALLOWED_MIME_, mime)) throw AppError_('VALIDASI', 'Jenis fail tak dibenarkan. Hanya JPG, PNG atau PDF');
+  var b64 = String(file.data || '');
+  if (!b64) throw AppError_('VALIDASI', 'Fail kosong');
+  if (b64.length > MAX_B64_CHARS_) throw AppError_('VALIDASI', 'Fail terlalu besar. Maksimum 3 MB');
+  var bytes;
+  try { bytes = Utilities.base64Decode(b64); } catch (e) { throw AppError_('VALIDASI', 'Fail rosak'); }
+  if (bytes.length > MAX_FILE_BYTES_) throw AppError_('VALIDASI', 'Fail terlalu besar. Maksimum 3 MB');
+  if (sniffMime_(bytes) !== mime) throw AppError_('VALIDASI', 'Kandungan fail tak sepadan dengan jenisnya');
+  return { bytes: bytes, mime: mime, ext: ALLOWED_MIME_[mime] };
+}
+
+function apiSaveCert_(ctx) {
+  var p = ctx.params;
+  var up = p.file ? decodeUpload_(p.file) : null;   // semak fail sebelum sentuh apa-apa
+  return withLock_(function () {
+    var editing = !!p.cert_id;
+    var existing = null;
+    if (editing) {
+      existing = readTable_('Certs').filter(function (c) { return c.cert_id === String(p.cert_id); })[0];
+      if (!existing) throw AppError_('TIADA', 'Cert tak dijumpai');
+    }
+    var staffId = editing ? existing.staff_id : vStr_(p.staff_id, 'staff_id', 20, true).toUpperCase();
+    var typeCode = editing ? existing.type_code : vStr_(p.type_code, 'Jenis cert', 30, true).toUpperCase();
+    if (!readTable_('Personnel').some(function (x) { return x.staff_id === staffId; })) throw AppError_('VALIDASI', 'Personel tak dijumpai');
+    var type = certTypeMap_()[typeCode];
+    if (!type || (!editing && !isTrue_(type.active))) throw AppError_('VALIDASI', 'Jenis cert tak sah');
+
+    var certNo = vStr_(p.cert_no, 'Nombor cert', 60, false);
+    if (certNo && !/^[A-Za-z0-9 \-\/._()#]+$/.test(certNo)) throw AppError_('VALIDASI', 'Nombor cert mengandungi aksara tak dibenarkan');
+    if (isTrue_(type.has_number) && !certNo) throw AppError_('VALIDASI', 'Nombor cert wajib untuk ' + type.type_name);
+    var issue = vDate_(p.issue_date, 'Tarikh keluaran', false);
+    var expiry = isTrue_(type.has_expiry) ? vDate_(p.expiry_date, 'Tarikh tamat', true) : null;
+    if (issue && expiry && expiry.getTime() < issue.getTime()) throw AppError_('VALIDASI', 'Tarikh tamat mesti selepas atau sama dengan tarikh keluaran');
+    var rec = {
+      cert_no: certNo, detail: vStr_(p.detail, 'Butiran', 200, false),
+      issue_date: issue || '', expiry_date: expiry || '', remarks: vStr_(p.remarks, 'Catatan', 300, false)
+    };
+
+    var now = new Date();
+    var certId = editing ? existing.cert_id : nextId_('counter_cert', 'C-', 6);
+    if (up) {
+      var expTxt = expiry ? Utilities.formatDate(expiry, APP.TZ, 'yyyyMMdd') : 'NA';
+      var fname = typeCode + '_' + expTxt + '_' + certId + '.' + up.ext;
+      var f = certFolder_(staffId).createFile(Utilities.newBlob(up.bytes, up.mime, fname));
+      rec.file_id = f.getId(); rec.file_name = fname;   // fail lama kekal dalam Drive
+    }
+    if (editing) {
+      updateRowCells_('Certs', existing._row, rec);
+    } else {
+      rec.cert_id = certId; rec.staff_id = staffId; rec.type_code = typeCode;
+      rec.record_status = 'Verified'; rec.reject_reason = '';
+      rec.submitted_by = ctx.session.user_id; rec.submitted_at = now;
+      rec.verified_by = ctx.session.user_id; rec.verified_at = now;
+      appendObjects_('Certs', [rec]);
+    }
+    audit_(ctx.session.user_id, 'save_cert', certId, (editing ? 'kemas kini ' : 'baru ') + typeCode + ' ' + staffId);
+    var saved = readTable_('Certs').filter(function (c) { return c.cert_id === certId; })[0];
+    var out = ser_('Certs', saved, CERT_FIELDS_); out.has_file = !!saved.file_id;
+    return { cert: out };
+  });
+}
+
+function apiGetCertFile_(ctx) {
+  var s = ctx.session;
+  var id = vStr_(ctx.params.cert_id, 'cert_id', 20, true);
+  var cert = readTable_('Certs').filter(function (c) { return c.cert_id === id; })[0];
+  var deny = AppError_('TIDAK_DIBENARKAN', 'Anda tak dibenarkan');
+  if (!cert) throw deny;                                   // jawapan sama untuk "tiada" dan "ditolak"
+  var type = certTypeMap_()[cert.type_code];
+  var sensitive = !!(type && isTrue_(type.is_sensitive));
+  if (s.role === 'Staf') {
+    if (!s.staff_id || cert.staff_id !== s.staff_id) throw deny;   // staff_id daripada sesi
+  } else if (s.role === 'Lead') {
+    if (sensitive || (cert.record_status !== 'Verified' && cert.record_status !== 'Pending')) throw deny;
+  }
+  if (!cert.file_id) throw AppError_('FAIL_TIADA', 'Fail tak dijumpai');
+  var blob;
+  try { blob = DriveApp.getFileById(String(cert.file_id)).getBlob(); } catch (e) { throw AppError_('FAIL_TIADA', 'Fail tak dapat dibuka'); }
+  if (sensitive) audit_(s.user_id, 'view_ic', cert.cert_id, 'fail ' + cert.type_code);
+  var mime = blob.getContentType();
+  return { name: String(cert.file_name || blob.getName() || 'fail'), mime: ALLOWED_MIME_[mime] ? mime : 'application/octet-stream', data: Utilities.base64Encode(blob.getBytes()) };
+}
+
+/* ---------------- Menu: tambah user Lead/Admin (sementara sehingga S-10 Fasa 4) ---------------- */
+function addUserFromMenu() {
+  var ui = tryUi_();
+  if (!ui) { alert_('Tambah user', 'Jalankan dari menu dalam spreadsheet.'); return null; }
+  var email = promptText_('Tambah user (1/3)', 'Email user:').toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { alert_('Tambah user', 'Email tak sah. Dibatalkan.'); return null; }
+  var name = promptText_('Tambah user (2/3)', 'Nama penuh:');
+  if (!name) { alert_('Tambah user', 'Nama kosong. Dibatalkan.'); return null; }
+  var roleIn = promptText_('Tambah user (3/3)', 'Role: taip Lead atau Admin').toLowerCase();
+  var role = roleIn === 'admin' ? 'Admin' : (roleIn === 'lead' ? 'Lead' : '');
+  if (!role) { alert_('Tambah user', 'Role mesti Lead atau Admin. Dibatalkan.'); return null; }
+  if (readTable_('Users').some(function (u) { return String(u.login_id).toLowerCase() === email; })) { alert_('Tambah user', 'Email ini sudah ada. Dibatalkan.'); return null; }
+  var pin = randomPin_();
+  ui.alert('PIN user (HANYA SEKALI)', 'Login: ' + email + '\nRole: ' + role + '\nPIN sementara: ' + pin + '\n\nHantar kepada user secara peribadi. User wajib tukar PIN pada login pertama.', ui.ButtonSet.OK);
+  var u = withLock_(function () {
+    var created = createUser_({ login_id: email, full_name: name.toUpperCase(), role: role, staff_id: '', pin: pin });
+    audit_(actorUserId_(), 'save_user', created.user_id, role);
+    return created;
+  });
+  return { user_id: u.user_id };
 }

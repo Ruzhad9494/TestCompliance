@@ -1,5 +1,5 @@
 {
   "name": "compliance-track-apps-script",
   "private": true,
-  "scripts": { "test": "TZ=Asia/Kuala_Lumpur node --test test/phase0.test.js" }
+  "scripts": { "test": "TZ=Asia/Kuala_Lumpur node --test test/phase0.test.js test/phase1.test.js" }
 }

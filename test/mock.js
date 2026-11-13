@@ -63,10 +63,12 @@ function chain(target, store) {
 }
 
 class Folder {
+  static allFiles = {};
   constructor(name) { this.name = name; this.id = 'fld-' + crypto.randomBytes(6).toString('hex'); this.kids = []; }
   getId() { return this.id; }
   getName() { return this.name; }
   createFolder(n) { const f = new Folder(n); this.kids.push(f); return f; }
+  createFile(blob) { const f = { id: 'file-' + crypto.randomBytes(8).toString('hex'), blob, getId() { return this.id; }, getBlob() { return this.blob; } }; this.files = this.files || []; this.files.push(f); Folder.allFiles[f.id] = f; return f; }
   getFoldersByName(n) { const m = this.kids.filter(k => k.name === n); let i = 0; return { hasNext: () => i < m.length, next: () => m[i++] }; }
 }
 
@@ -91,11 +93,23 @@ function createEnv(opts = {}) {
     newDataValidation: () => chain(null, {}),
     newConditionalFormatRule: () => chain(null, {})
   };
-  g.DriveApp = { getRootFolder: () => env.root, getFolderById: id => { const find = f => f.id === id ? f : f.kids.map(find).find(Boolean); const r = find(env.root); if (!r) throw new Error('folder tiada'); return r; } };
+  Folder.allFiles = {};
+  const cacheStore = {};
+  g.CacheService = { getScriptCache: () => ({
+    get: k => (cacheStore[k] && cacheStore[k].exp > Date.now() ? cacheStore[k].v : null),
+    put: (k, v, ttl) => { cacheStore[k] = { v, exp: Date.now() + ttl * 1000 }; },
+    remove: k => { delete cacheStore[k]; }
+  }) };
+  env.cache = cacheStore;
+  g.ContentService = { MimeType: { JSON: 'JSON' }, createTextOutput: t => ({ _t: t, setMimeType() { return this; }, getContent() { return this._t; } }) };
+  g.DriveApp = { getFileById: id => { const f = Folder.allFiles[id]; if (!f) throw new Error('Fail tiada'); return f; }, getRootFolder: () => env.root, getFolderById: id => { const find = f => f.id === id ? f : f.kids.map(find).find(Boolean); const r = find(env.root); if (!r) throw new Error('folder tiada'); return r; } };
   g.Utilities = {
     DigestAlgorithm: { SHA_256: 'SHA256' }, Charset: { UTF_8: 'utf8' },
     computeDigest: (a, s) => Array.from(crypto.createHash('sha256').update(s, 'utf8').digest()).map(b => b > 127 ? b - 256 : b),
     getUuid: () => crypto.randomUUID(),
+    base64Decode: b64 => { if (!/^[A-Za-z0-9+/=]*$/.test(b64)) throw new Error('base64 rosak'); return Array.from(Buffer.from(b64, 'base64')).map(b => b > 127 ? b - 256 : b); },
+    base64Encode: bytes => Buffer.from(bytes.map(b => b & 0xff)).toString('base64'),
+    newBlob: (bytes, mime, name) => ({ getBytes: () => bytes, getContentType: () => mime, getName: () => name }),
     formatDate: (d, tz, pat) => {
       const parts = Object.fromEntries(new Intl.DateTimeFormat('en-GB', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(d).map(p => [p.type, p.value]));
       return pat.replace('yyyy', parts.year).replace('MM', parts.month).replace('dd', parts.day).replace('HH', parts.hour).replace('mm', parts.minute);
